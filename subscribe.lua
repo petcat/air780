@@ -1,0 +1,8 @@
+sys.subscribe('memory_clean', function() collectgarbage('collect') end)
+sys.subscribe('http_notify', function() led.event() end)
+sys.subscribe('IP_READY', function() led.network(0) end)
+sys.subscribe('IP_LOSE', function() led.network(1) end)
+sys.subscribe('sms_send', function(num, txt)
+    log.info('SMS', num, txt)
+    sms.send(num, txt)
+end)
