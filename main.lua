@@ -1,5 +1,5 @@
 PROJECT = 'Air780_SMS'
-VERSION = '0.6.66'
+VERSION = '0.6.67'
 
 log.setLevel(2)
 log.style(1)
@@ -37,17 +37,20 @@ end
 
 local http_opt = config.notify.http.options
 
--- 修复 HTTP 请求语法及状态码判定
+--  HTTP 请求语法及状态码判定
 sys.subscribe('http_notify', function(method, url, headers, body, n)
     if n > http_opt.retry then return end
     sys.taskInit(function()
         local _, _, _, ipv6 = socket.localIP()
+        
+        -- 必须加上 .wait() 挂起协程，等待底层异步网络返回真正结果
         local code, resp_headers, res = http.request(method, url, headers, body, {
             timeout = http_opt.timeout * 1000,
             ipv6    = (ipv6 ~= nil)
-        })
+        }).wait()
 
-        if code >= 200 and code < 300 then
+        -- 此时 code 明确为数字，比较逻辑安全安全稳定
+        if code and code >= 200 and code < 300 then
             log.info('HTTP', '推送成功', code, res)
         else
             log.warn('HTTP', '推送失败，准备重试', code, n)
@@ -62,6 +65,17 @@ for _, v in ipairs(config.system.ctrl) do ctrl[v] = true end
 for k, v in pairs(config.notify.http.channel) do
     if v.enable == 1 then table.insert(http_chl, k) end
 end
+
+-- 远程短信指令控制逻辑
+sys.subscribe('sms_build_sms', function(from, content)
+    if #config.system.ctrl < 1 or ctrl[from] then
+        -- 匹配规则：以 SMS/sms 开头，兼容 ##、#、逗号、空格、冒号等任意分隔符
+        local cmd, target, rTxt = content:match('^(%a+)[%s#,:]+(%d+)[%s#,:]+(.+)$')
+        if cmd and cmd:lower() == 'sms' and target and rTxt then
+            sys.publish('sms_send', target, rTxt)
+        end
+    end
+end)
 
 sys.subscribe('notify_build', function(type, from, content)
     sys.publish('sms_build_' .. type, from, content)
@@ -102,25 +116,31 @@ sys.subscribe('IP_READY', function(...)
     sys.publish('notify_build', 'msg', '', content)
 end)
 
+sys.subscribe('IP_LOSE', function()
+    network.onl = false
+end)
+
 sys.subscribe('SMS_INC', function(from, txt)
     sys.publish('notify_build', 'sms', from, txt)
 end)
 
--- 呼叫处理模块
+-- 呼交处理模块
 if cc then
-    local call = { incoming = false, count = 0 }
+    local call = { incoming = false, count = 0, answered = false }
     sys.subscribe('CC_IND', function(status)
         local cfg  = config.call.accept
         local from = cc.lastNum() or '未知号码'
 
         if status == 'READY' then cc.init(0)
         elseif status == 'ANSWER_CALL_DONE' then cc.hangUp()
-        elseif status == 'DISCONNECTED' or status == 'HANGUP_CALL_DONE' then call = { incoming = false, count = 0 }
+        elseif status == 'DISCONNECTED' or status == 'HANGUP_CALL_DONE' then 
+            call = { incoming = false, count = 0, answered = false }
         elseif status == 'INCOMINGCALL' then
             if not call.incoming then sys.publish('notify_build', 'call', from, '') end
             call.incoming = true
             call.count = call.count + 1
-            if call.count == 3 and ((isMobile(from) and cfg.M == 1) or cfg.L == 1) then
+            if call.count >= 3 and not call.answered and ((isMobile(from) and cfg.M == 1) or cfg.L == 1) then
+                call.answered = true
                 cc.accept()
             end
         end
@@ -132,7 +152,11 @@ local ka = config.task and config.task.keep_alive
 if ka and ka.enable == 1 and isMobile(ka.number) then
     sys.taskInit(function()
         fskv.init()
-        while not mobile.status() do sys.wait(1000) end -- 轮询网络就绪状态，规避 waitUntil 死锁
+        
+        -- 安全检查网络：如果还没有获取到本地 IP，就挂起等待 IP_READY 事件
+        if not socket.localIP() then
+            sys.waitUntil('IP_READY')
+        end
 
         sys.timerLoopStart(function()
             local target_hours = ka.days * 24
@@ -148,5 +172,7 @@ if ka and ka.enable == 1 and isMobile(ka.number) then
         end, 3600000)
     end)
 end
+
+sys.timerLoopStart(sys.publish, 30000, 'memory_clean')
 
 sys.run()
